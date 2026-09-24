@@ -278,5 +278,136 @@ class SpeakerReconcileApiTests(unittest.TestCase):
         self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class ChapterAlignApiTests(unittest.TestCase):
+    WORDS = [
+        {"start_ms": 0, "end_ms": 500, "text": "大家好", "speaker": "A"},
+        {"start_ms": 600, "end_ms": 1200, "text": "今天聊", "speaker": "A"},
+        {"start_ms": 1300, "end_ms": 2000, "text": "动态规划", "speaker": "A"},
+        {"start_ms": 2200, "end_ms": 2800, "text": "明天见", "speaker": "B"},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {
+            "words": self.WORDS,
+            "chapters": [
+                {"title": "开场", "cue": "大家", "approx_ms": 0},
+                {"title": "主题", "cue": "动态", "approx_ms": 1000},
+            ],
+            "min_gap_ms": 500,
+        }
+        payload.update(overrides)
+        return self.client.post("/chapter-align", json=payload)
+
+    def test_basic_alignment(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["total_deviation_ms"], 300)
+        self.assertEqual(
+            data["chapters"],
+            [
+                {
+                    "index": 0,
+                    "title": "开场",
+                    "time_ms": 0,
+                    "word_index": 0,
+                    "char_start": 0,
+                    "char_end": 2,
+                },
+                {
+                    "index": 1,
+                    "title": "主题",
+                    "time_ms": 1300,
+                    "word_index": 2,
+                    "char_start": 0,
+                    "char_end": 2,
+                },
+            ],
+        )
+
+    def test_cross_word_hit(self):
+        words = [
+            {"start_ms": 0, "end_ms": 500, "text": "动态", "speaker": "A"},
+            {"start_ms": 500, "end_ms": 1000, "text": "规划", "speaker": "A"},
+        ]
+        resp = self.post(
+            words=words,
+            chapters=[{"title": "t", "cue": "动态规划", "approx_ms": 100}],
+            min_gap_ms=1,
+        )
+        self.assertEqual(resp.status_code, 200)
+        ch = resp.json()["chapters"][0]
+        self.assertEqual(ch["time_ms"], 0)  # 候选时刻取命中首字符所在词
+        self.assertEqual(ch["word_index"], 0)
+        self.assertEqual([ch["char_start"], ch["char_end"]], [0, 2])  # 截断到词末
+
+    def test_speaker_boundary_blocks_hit(self):
+        words = [
+            {"start_ms": 0, "end_ms": 100, "text": "ab", "speaker": "A"},
+            {"start_ms": 100, "end_ms": 200, "text": "cd", "speaker": "B"},
+        ]
+        resp = self.post(
+            words=words,
+            chapters=[{"title": "t", "cue": "bc", "approx_ms": 0}],
+            min_gap_ms=1,
+        )
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "infeasible_chapter_alignment")
+        self.assertEqual(err["chapter_index"], 0)
+
+    def test_gap_infeasible(self):
+        words = [
+            {"start_ms": 0, "end_ms": 100, "text": "甲", "speaker": "A"},
+            {"start_ms": 200, "end_ms": 300, "text": "乙", "speaker": "A"},
+        ]
+        resp = self.post(
+            words=words,
+            chapters=[
+                {"title": "a", "cue": "甲", "approx_ms": 0},
+                {"title": "b", "cue": "乙", "approx_ms": 0},
+            ],
+            min_gap_ms=1000,
+        )
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "infeasible_chapter_alignment")
+        self.assertEqual(err["chapter_count"], 2)
+        self.assertEqual(err["min_gap_ms"], 1000)
+
+    def test_min_gap_must_be_positive(self):
+        for bad in (0, -1):
+            resp = self.post(min_gap_ms=bad)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_chapter_fields_required(self):
+        # 空 chapters、空 cue、负 approx_ms 均为 422
+        for chapters in (
+            [],
+            [{"title": "t", "cue": "", "approx_ms": 0}],
+            [{"title": "t", "cue": "甲", "approx_ms": -1}],
+            [{"title": "", "cue": "甲", "approx_ms": 0}],
+        ):
+            resp = self.post(chapters=chapters)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_word_validation_reused(self):
+        words = [dict(self.WORDS[1]), dict(self.WORDS[0])]  # 时间倒序
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+    def test_segments_still_works(self):
+        resp = self.client.post("/segments", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()

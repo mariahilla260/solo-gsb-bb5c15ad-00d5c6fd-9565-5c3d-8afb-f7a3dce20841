@@ -1,15 +1,18 @@
 """FastAPI 入口：POST /segments 字幕分段、POST /ad-breaks 广告插播点、
-POST /speaker-reconcile 说话人校正服务。"""
+POST /speaker-reconcile 说话人校正、POST /chapter-align 章节时刻对齐服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .ad_breaks import optimal_ad_breaks
+from .chapter_align import align_chapters
 from .errors import DomainError
 from .schemas import (
     AdBreakRequest,
     AdBreakResponse,
+    ChapterAlignRequest,
+    ChapterAlignResponse,
     SegmentRequest,
     SegmentResponse,
     SpeakerReconcileRequest,
@@ -22,8 +25,9 @@ from .srt import render_srt
 app = FastAPI(
     title="Podcast Subtitle Segmentation API",
     description="播客转写后处理：在硬约束下用动态规划求最优字幕分段（JSON 与 SRT），"
-    "在词间静音处选择最优广告插播点，并在人工锁定约束下校正说话人标注。",
-    version="1.2.0",
+    "在词间静音处选择最优广告插播点，在人工锁定约束下校正说话人标注，"
+    "并按章节 cue 文本命中把章节对齐到词时间轴。",
+    version="1.3.0",
 )
 
 
@@ -46,7 +50,9 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         "请求体不合法：words 必须为非空数组，每项含非负整数 start_ms/end_ms、"
         "非空字符串 text/speaker；/ad-breaks 另需 break_count∈[1,5]、"
         "min_silence_ms≥1、min_spacing_ms≥0；/speaker-reconcile 另需 "
-        "switch_cost∈[0,10]，locks 每项含整数 word_index 与非空 speaker",
+        "switch_cost∈[0,10]，locks 每项含整数 word_index 与非空 speaker；"
+        "/chapter-align 另需非空 chapters（每项含非空 title/cue、非负整数 "
+        "approx_ms）与正整数 min_gap_ms",
         {"errors": exc.errors()},
     )
 
@@ -89,4 +95,17 @@ async def create_speaker_reconcile(request: SpeakerReconcileRequest):
         words=words,
         changed_word_indices=changed_word_indices,
         total_cost=total_cost,
+    )
+
+
+@app.post("/chapter-align", response_model=ChapterAlignResponse)
+async def create_chapter_align(request: ChapterAlignRequest):
+    chapters, total_deviation_ms = align_chapters(
+        request.words,
+        request.chapters,
+        request.min_gap_ms,
+    )
+    return ChapterAlignResponse(
+        chapters=chapters,
+        total_deviation_ms=total_deviation_ms,
     )

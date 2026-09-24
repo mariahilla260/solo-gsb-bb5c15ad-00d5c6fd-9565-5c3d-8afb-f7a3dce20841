@@ -2,8 +2,9 @@
 
 接收播客转写后按时间排列的词序列，在硬约束下用**动态规划**求出总分最低的字幕分段方案，
 同时返回分段 JSON 与 SRT 字幕文本；另提供**广告插播点**接口，在词间静音处选出
-总静音最长、满足间隔约束的插播位置，以及**说话人校正**接口，在人工锁定约束下
-以最小代价重指派说话人。基于 Python 3.12 + FastAPI。
+总静音最长、满足间隔约束的插播位置，**说话人校正**接口，在人工锁定约束下
+以最小代价重指派说话人，以及**章节时刻对齐**接口，按章节 cue 文本在同一说话人
+连续词中的命中把章节锚定到词时间轴。基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
 
@@ -11,11 +12,13 @@
 docker compose up --build
 ```
 
+该命令自动完成镜像构建、依赖安装（`requirements.txt`）并启动服务，
 服务监听并映射到宿主机 **`http://localhost:8000`**。
 
 - 分段接口：`POST http://localhost:8000/segments`
 - 广告插播点接口：`POST http://localhost:8000/ad-breaks`
 - 说话人校正接口：`POST http://localhost:8000/speaker-reconcile`
+- 章节时刻对齐接口：`POST http://localhost:8000/chapter-align`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -280,13 +283,119 @@ curl -s http://localhost:8000/speaker-reconcile \
   -d '{"words":[{"start_ms":0,"end_ms":1800,"text":"大家好。","speaker":"A"},{"start_ms":1800,"end_ms":3600,"text":"我是小明。","speaker":"A"},{"start_ms":3600,"end_ms":5400,"text":"谢谢。","speaker":"B"},{"start_ms":5400,"end_ms":7200,"text":"下期再见。","speaker":"A"}],"locks":[{"word_index":2,"speaker":"B"}],"switch_cost":2}'
 ```
 
+## 章节时刻对齐：`POST /chapter-align`
+
+把按章节顺序排列的章节锚定到词时间轴：每条章节 `cue` 在**同一说话人连续词**的
+拼接文本中查找全部 Unicode 字符命中（允许跨词、允许重叠），每章选一个命中，使
+各章实际时刻与预计起点 `approx_ms` 的**绝对时间偏差之和最小**。`words` 字段与
+`/segments` 完全相同，并沿用同一套词序与时间校验（422 错误码一致）。
+
+服务地址：`POST http://localhost:8000/chapter-align`
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 500,  "text": "大家好",   "speaker": "A"},
+    {"start_ms": 600,  "end_ms": 1200, "text": "今天聊",   "speaker": "A"},
+    {"start_ms": 1300, "end_ms": 2000, "text": "动态规划", "speaker": "A"},
+    {"start_ms": 2200, "end_ms": 2800, "text": "明天见",   "speaker": "B"}
+  ],
+  "chapters": [
+    {"title": "开场", "cue": "大家", "approx_ms": 0},
+    {"title": "主题", "cue": "动态", "approx_ms": 1000}
+  ],
+  "min_gap_ms": 500
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `chapters` | 非空数组 | 按章节顺序排列；每项含非空 `title`、非空 `cue`、非负整数 `approx_ms`（预计起点，毫秒） |
+| `min_gap_ms` | 正整数 | 相邻章节实际时刻的最小间隔（毫秒）；该约束蕴含时刻严格递增 |
+
+### 对齐规则
+
+1. **候选命中**：对每章 `cue`，把每个**同一说话人连续区间**内所有词的文本原样
+   拼接（不插空格），枚举 `cue` 的全部 Unicode 字符命中（按 code point 比较，
+   `😀` 算 1 个字符）。命中**允许跨词**，但不允许跨越说话人边界；同一文本中的
+   重叠出现也各自算一条命中（如 `cue="aa"` 在 `"aaa"` 中有 2 条命中）；
+2. **候选时刻**：取**命中首字符所在词**的 `start_ms`；
+3. **选择约束**：为每章恰选 1 条命中，相邻章节候选时刻严格递增且至少相隔
+   `min_gap_ms`（正间隔即保证严格递增）；
+4. **目标**：最小化 `Σ |实际时刻 - approx_ms|`；
+5. **同分裁决**：取各章**命中起始全局字符位**序列字典序最小者。全局字符位为
+   命中首字符在“全部 `words` 文本原样拼接”中的 0-based code point 偏移；
+6. 任一章没有任何命中，或无法为所有章节组成完整方案时返回 **422**
+   （`infeasible_chapter_alignment`）。
+
+### 响应示例（200）
+
+```json
+{
+  "chapters": [
+    {
+      "index": 0,
+      "title": "开场",
+      "time_ms": 0,
+      "word_index": 0,
+      "char_start": 0,
+      "char_end": 2
+    },
+    {
+      "index": 1,
+      "title": "主题",
+      "time_ms": 1300,
+      "word_index": 2,
+      "char_start": 0,
+      "char_end": 2
+    }
+  ],
+  "total_deviation_ms": 300
+}
+```
+
+> `chapters` 按输入章节顺序返回，`index` 为 0-based 章序号。
+> `word_index` 为命中首字符所在词序号（0-based）；`char_start`/`char_end` 为该词内
+> Unicode 字符偏移区间 `[char_start, char_end)`：命中完全落在一个词内时覆盖整条
+> cue（上例即“大家”“动态”）；**跨词命中时区间截断到命中首字符所在词的词末**，
+> 即 `char_end` 等于该词字符数（候选时刻仍取该词 `start_ms`）。
+> 上例总偏差 300：`|0-0| + |1300-1000|`。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/chapter-align \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":500,"text":"大家好","speaker":"A"},{"start_ms":600,"end_ms":1200,"text":"今天聊","speaker":"A"},{"start_ms":1300,"end_ms":2000,"text":"动态规划","speaker":"A"},{"start_ms":2200,"end_ms":2800,"text":"明天见","speaker":"B"}],"chapters":[{"title":"开场","cue":"大家","approx_ms":0},{"title":"主题","cue":"动态","approx_ms":1000}],"min_gap_ms":500}'
+```
+
+### 无法组成完整方案
+
+任一章 cue 无命中（含只在说话人边界两侧“拼接”才出现的情形），或受
+`min_gap_ms` 限制无法为全部章节选出严格递增时刻时，返回 422：
+
+```json
+{
+  "error": {
+    "code": "infeasible_chapter_alignment",
+    "message": "不存在满足时刻严格递增且相邻至少相隔 min_gap_ms 的完整章节对齐方案",
+    "chapter_count": 2,
+    "min_gap_ms": 1000
+  }
+}
+```
+
+某章无命中时错误体携带 `chapter_index`（最早无命中的章序号，0-based）。
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 非正、空 `chapters`/`title`/`cue`） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
@@ -295,6 +404,7 @@ curl -s http://localhost:8000/speaker-reconcile \
 | `lock_index_out_of_range` | 锁定词序号越界（含负数） | `word_index` |
 | `duplicate_lock` | 同一词序号被重复锁定 | `word_index` |
 | `too_many_speakers` | 候选说话人（原标注 ∪ 锁定值）超过 8 个 | `speaker_count` |
+| `infeasible_chapter_alignment` | 某章 cue 无命中，或无法组成满足间隔约束的完整章节方案 | 无命中时为 `chapter_index`；否则为 `chapter_count`、`min_gap_ms` |
 
 ### 无可行分段
 
@@ -351,6 +461,14 @@ curl -s http://localhost:8000/segments \
 每行预求最小值与次小值即可 O(m) 完成；重建阶段从左向右贪心，每步在仍能
 达到最优总成本的候选中取字典序最小的说话人，归纳可得整条序列字典序最小。
 
+章节时刻对齐（`chapter_align.py`）为后向 DP + 贪心重建，**O(H·log H) 时间、
+O(H) 空间**（H 为各章命中候选总数）。每章候选按全局字符位升序枚举，候选时刻
+随词序非降；`suf[j][p]` 表示第 j 章从其第 p 个候选（含）起为后缀 `[j, C)` 能
+取得的最小绝对偏差之和，行间转移用二分（`bisect_left`）定位下一章第一个满足
+`min_gap_ms` 的候选，并对每行从右向左扫出后缀最小值；重建时逐章从左向右枚举，
+第一个满足间隔且“本章偏差 + 后缀最小”恰等于剩余预算的候选即全局字符位最小的
+可行选择，归纳可得命中起始全局字符位序列字典序最小。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -375,12 +493,14 @@ app/
   segmentation.py       # 输入校验 + 动态规划核心（纯标准库）
   ad_breaks.py          # 广告插播点选择（纯标准库，复用同一套输入校验）
   speaker_reconcile.py  # 说话人校正（纯标准库，复用同一套输入校验）
+  chapter_align.py      # 章节时刻对齐（纯标准库，复用同一套输入校验）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_segmentation.py
   test_ad_breaks.py
   test_speaker_reconcile.py
+  test_chapter_align.py
   test_differential.py
   test_api.py
 Dockerfile
