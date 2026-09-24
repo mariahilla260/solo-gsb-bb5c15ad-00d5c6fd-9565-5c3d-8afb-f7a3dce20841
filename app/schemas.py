@@ -76,3 +76,32 @@ class SpeakerReconcileResponse(BaseModel):
     total_cost: int = Field(
         ..., description="最小总成本：改动词数 + switch_cost × 相邻换人次数"
     )
+
+
+class ChapterIn(BaseModel):
+    title: str = Field(..., min_length=1, description="章节标题")
+    cue: str = Field(..., min_length=1, description="章节 cue：在同说话人连续词文本中查找的非空子串")
+    approx_ms: int = Field(..., ge=0, description="章节预计起点（毫秒，非负整数）")
+
+
+class ChapterAlignRequest(BaseModel):
+    words: list[WordIn] = Field(..., min_length=1, description="按时间排列的词序列")
+    chapters: list[ChapterIn] = Field(..., min_length=1, description="按章节顺序排列的章节列表")
+    min_gap_ms: int = Field(..., ge=1, description="相邻章节实际时刻最小间隔（毫秒，正整数）")
+
+
+class ChapterAlignOut(BaseModel):
+    index: int
+    title: str = Field(..., description="章节标题（与输入一致）")
+    time_ms: int = Field(..., description="实际时刻：命中首字符所在词的 start_ms")
+    word_index: int = Field(..., description="命中首字符所在词序号（0-based）")
+    char_start: int = Field(..., description="命中在该词内的起始字符位（0-based，按 code point）")
+    char_end: int = Field(
+        ...,
+        description="命中在该词内的结束字符位（右开区间，按 code point；跨词时为该词文本长度）",
+    )
+
+
+class ChapterAlignResponse(BaseModel):
+    chapters: list[ChapterAlignOut] = Field(..., description="按章节顺序排列的对齐结果")
+
